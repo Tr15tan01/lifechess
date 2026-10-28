@@ -24,6 +24,10 @@ const Board3D = dynamic(() => import('./board-3d'), { ssr: false, loading: () =>
 const END_TEXT = { CHECKMATE: 'by checkmate', RESIGNATION: 'by resignation', STALEMATE: 'by stalemate', REPETITION: 'by repetition', INSUFFICIENT: 'by insufficient material', FIFTY_MOVE: 'by the fifty-move rule' } as const
 const MOOD_STYLE = { up: 'border-ok/50 bg-ok/10', steady: 'border-line-strong bg-surface-2/60', down: 'border-bad/50 bg-bad/10' } as const
 const MOOD_LABEL = { up: 'Good news', steady: 'Life goes on', down: 'Setback' } as const
+/** The opponent waits this long after your move (plus a little randomness) so you can watch it land. */
+const BOT_MIN_DELAY_MS = 1700
+const BOT_JITTER_MS = 900
+const GRID = 'grid gap-5 px-4 pb-16 pt-4 sm:px-6 md:grid-cols-[minmax(0,1fr)_18rem] md:gap-6 lg:grid-cols-[minmax(0,1fr)_21rem] lg:px-8 xl:grid-cols-[minmax(0,1fr)_23rem]'
 
 function webglAvailable(): boolean {
   try {
@@ -36,7 +40,7 @@ function webglAvailable(): boolean {
 
 function Toggle({ label, hint, checked, onChange }: { label: string; hint: string; checked: boolean; onChange: (v: boolean) => void }) {
   return (
-    <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)} className="flex w-full items-center justify-between gap-4 rounded-[12px] border border-line px-3.5 py-2.5 text-left transition-colors hover:border-gold/50">
+    <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)} className="flex w-full cursor-pointer items-center justify-between gap-4 rounded-[12px] border border-line px-3.5 py-2.5 text-left transition-colors hover:border-gold/50">
       <span>
         <span className="block text-sm font-medium text-ink">{label}</span>
         <span className="block text-[12.5px] text-ink-3">{hint}</span>
@@ -112,8 +116,10 @@ export function GameClient({ user }: { user: { name: string } | null }) {
     setThinking(true)
     const started = Date.now()
     const fen = chess.fen()
+    // The first move of a game (bot plays White) can come quicker; otherwise give the player time to watch their move land.
+    const wait = game.moves.length === 0 ? 900 : BOT_MIN_DELAY_MS + Math.random() * BOT_JITTER_MS
     void askBot(fen, game.level).then(async (mv) => {
-      await new Promise((r) => setTimeout(r, Math.max(0, 450 - (Date.now() - started))))
+      await new Promise((r) => setTimeout(r, Math.max(0, wait - (Date.now() - started))))
       setThinking(false)
       if (!mv) return
       setGame((g) => (g && g.id === game.id && g.moves.length === game.moves.length ? (play(g, mv.from, mv.to, mv.promotion) ?? g) : g))
@@ -186,7 +192,7 @@ export function GameClient({ user }: { user: { name: string } | null }) {
 
   const onSquare = (sq: string) => {
     if (!myTurn || !game) return
-    if (selected && targets.includes(sq)) {
+    if (selected && (targets as string[]).includes(sq)) {
       if (legal.some((m) => m.from === selected && m.to === sq && m.promotion)) setPromo({ from: selected, to: sq })
       else move(selected, sq)
       return
@@ -208,8 +214,8 @@ export function GameClient({ user }: { user: { name: string } | null }) {
 
   if (!ready || !game) {
     return (
-      <div className="grid gap-6 px-4 pb-16 pt-6 sm:px-8 xl:grid-cols-[minmax(0,1fr)_24rem]">
-        <div className="aspect-square w-full animate-pulse rounded-[14px] bg-surface-2" />
+      <div className={GRID}>
+        <div className="mx-auto aspect-square w-full max-w-[min(100%,calc(100svh-10rem))] animate-pulse rounded-[14px] bg-surface-2" />
         <div className="h-96 animate-pulse rounded-[14px] bg-surface-2" />
       </div>
     )
@@ -227,7 +233,7 @@ export function GameClient({ user }: { user: { name: string } | null }) {
   const status = ended
     ? `${game.status === 'WON' ? 'You won' : game.status === 'LOST' ? 'You lost' : 'Draw'} ${game.endReason ? END_TEXT[game.endReason] : ''}`
     : thinking
-      ? 'Your opponent is thinking…'
+      ? 'Opponent is thinking'
       : chess.inCheck() && myTurn
         ? 'Check! Protect your king.'
         : myTurn
@@ -239,30 +245,40 @@ export function GameClient({ user }: { user: { name: string } | null }) {
   for (let i = 0; i < sans.length; i += 2) pairs.push([sans[i], sans[i + 1]])
 
   return (
-    <div className="grid gap-6 px-4 pb-16 pt-6 sm:px-8 xl:grid-cols-[minmax(0,1fr)_24rem]">
-      <div className="mx-auto w-full min-w-0 max-w-[min(100%,82dvh)] space-y-4 xl:max-w-none">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <p className="font-display text-2xl leading-tight" aria-live="polite">{status}</p>
-            <p className="text-[13px] text-ink-3">
+    <div className={GRID}>
+      <div className="mx-auto w-full min-w-0 max-w-[min(100%,calc(100svh-10rem))] space-y-4">
+        {/* Fixed-height, non-wrapping row: status text changes never push the board down. */}
+        <div className="flex h-14 items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="flex items-center gap-2 truncate font-display text-xl leading-tight sm:text-2xl" aria-live="polite">
+              <span className="truncate">{status}</span>
+              {thinking && (
+                <span className="typing inline-flex shrink-0 gap-1" aria-hidden>
+                  <span className="size-1.5 rounded-full bg-gold" />
+                  <span className="size-1.5 rounded-full bg-gold" />
+                  <span className="size-1.5 rounded-full bg-gold" />
+                </span>
+              )}
+            </p>
+            <p className="truncate text-[13px] text-ink-3">
               {levelLabel(game.level)} opponent · you play {game.color === 'w' ? 'White' : 'Black'}
             </p>
           </div>
-          <div role="radiogroup" aria-label="Board view" className="inline-flex rounded-full border border-line-strong p-0.5">
+          <div role="radiogroup" aria-label="Board view" className="inline-flex shrink-0 rounded-full border border-line-strong p-0.5">
             {(
               [
                 ['3d', '3D', Box],
                 ['2d', '2D', Grid3x3],
               ] as const
             ).map(([m, label, Icon]) => (
-              <button key={m} type="button" role="radio" aria-checked={boardMode === m} disabled={m === '3d' && !webgl} onClick={() => updateSettings({ board: m })} className={cn('inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[13px] transition-colors disabled:opacity-40', boardMode === m ? 'bg-gold text-gold-ink' : 'text-ink-2 hover:text-ink')}>
+              <button key={m} type="button" role="radio" aria-checked={boardMode === m} disabled={m === '3d' && !webgl} onClick={() => updateSettings({ board: m })} className={cn('inline-flex cursor-pointer items-center gap-1.5 rounded-full px-3 py-1 text-[13px] transition-colors disabled:cursor-not-allowed disabled:opacity-40', boardMode === m ? 'bg-gold text-gold-ink' : 'text-ink-2 hover:text-ink')}>
                 <Icon className="size-3.5" aria-hidden /> {label}
               </button>
             ))}
           </div>
         </div>
 
-        <div className="relative aspect-square w-full">{boardMode === '3d' ? <Board3D {...boardProps} className="size-full" /> : <Board2D {...boardProps} />}</div>
+        <div className="relative aspect-square w-full touch-manipulation">{boardMode === '3d' ? <Board3D {...boardProps} className="size-full" /> : <Board2D {...boardProps} />}</div>
 
         {settings.hints && latest && (
           <div key={latest.ply + latest.text} className={cn('animate-rise rounded-[14px] border px-4 py-3.5', MOOD_STYLE[latest.mood])} aria-live="polite">
@@ -289,7 +305,7 @@ export function GameClient({ user }: { user: { name: string } | null }) {
         )}
       </div>
 
-      <aside className="min-w-0 space-y-4">
+      <aside className="min-w-0 space-y-4 md:sticky md:top-[4.75rem] md:max-h-[calc(100svh-5.75rem)] md:self-start md:overflow-y-auto md:overscroll-contain md:pr-1 md:[scrollbar-gutter:stable] md:[scrollbar-width:thin] md:[&>section]:p-4 lg:[&>section]:p-5">
         <Panel>
           <PanelTitle action={<Badge tone="gold">Life {game.score}</Badge>}>Your game</PanelTitle>
           <Meter value={game.score} label="Life score" tone={game.score >= 50 ? 'ok' : 'bad'} />
@@ -297,35 +313,6 @@ export function GameClient({ user }: { user: { name: string } | null }) {
           <div className="mt-4 flex flex-wrap gap-2">
             <Button variant="secondary" size="sm" onClick={startNew}><RotateCcw className="size-3.5" aria-hidden /> New game</Button>
             <Button variant="ghost" size="sm" onClick={doResign} disabled={!active || game.moves.length === 0}><Flag className="size-3.5" aria-hidden /> Resign</Button>
-          </div>
-        </Panel>
-
-        <Panel>
-          <PanelTitle>Next game</PanelTitle>
-          <div role="radiogroup" aria-label="Difficulty" className="grid grid-cols-5 gap-1">
-            {LEVELS_INFO.map((l) => (
-              <button key={l.level} type="button" role="radio" aria-checked={settings.level === l.level} onClick={() => updateSettings({ level: l.level as BotLevel })} className={cn('rounded-[10px] border px-1 py-2 text-center text-[12px] leading-tight transition-colors', settings.level === l.level ? 'border-gold bg-gold/15 text-ink' : 'border-line text-ink-2 hover:border-gold/50')}>
-                <span className="block font-display text-base">{l.level}</span>
-                {l.label}
-              </button>
-            ))}
-          </div>
-          <p className="mt-2 text-[12.5px] text-ink-3">{LEVELS_INFO.find((l) => l.level === settings.level)?.blurb}</p>
-          <div role="radiogroup" aria-label="Your colour" className="mt-4 inline-flex rounded-full border border-line-strong p-0.5">
-            {(['w', 'b', 'random'] as const).map((c) => (
-              <button key={c} type="button" role="radio" aria-checked={settings.color === c} onClick={() => updateSettings({ color: c })} className={cn('rounded-full px-3 py-1 text-[13px] transition-colors', settings.color === c ? 'bg-gold text-gold-ink' : 'text-ink-2 hover:text-ink')}>
-                {c === 'w' ? 'White' : c === 'b' ? 'Black' : 'Random'}
-              </button>
-            ))}
-          </div>
-          <p className="mt-2 text-[12.5px] text-ink-3">Applies when you start a new game.</p>
-        </Panel>
-
-        <Panel>
-          <PanelTitle>Helpers</PanelTitle>
-          <div className="space-y-2">
-            <Toggle label="Coaching tips" hint="Warns about hanging pieces, checks and opening basics." checked={settings.tips} onChange={(v) => { updateSettings({ tips: v }); if (!v) setHintMove(null) }} />
-            <Toggle label="Life hints" hint="Each move becomes a small life situation." checked={settings.hints} onChange={(v) => updateSettings({ hints: v })} />
           </div>
         </Panel>
 
@@ -344,6 +331,35 @@ export function GameClient({ user }: { user: { name: string } | null }) {
             {hintMove && <p className="mt-3 text-[12.5px] text-ink-3">The suggested move is highlighted in green on the board. Using it is marked in your stats.</p>}
           </Panel>
         )}
+
+        <Panel>
+          <PanelTitle>Next game</PanelTitle>
+          <div role="radiogroup" aria-label="Difficulty" className="grid grid-cols-5 gap-1">
+            {LEVELS_INFO.map((l) => (
+              <button key={l.level} type="button" role="radio" aria-checked={settings.level === l.level} onClick={() => updateSettings({ level: l.level as BotLevel })} className={cn('min-w-0 cursor-pointer rounded-[10px] border px-0 py-2 text-center text-[10.5px] leading-tight tracking-tight transition-colors lg:text-[11.5px]', settings.level === l.level ? 'border-gold bg-gold/15 text-ink' : 'border-line text-ink-2 hover:border-gold/50')}>
+                <span className="block font-display text-base">{l.level}</span>
+                <span className="block truncate">{l.label}</span>
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-[12.5px] text-ink-3">{LEVELS_INFO.find((l) => l.level === settings.level)?.blurb}</p>
+          <div role="radiogroup" aria-label="Your colour" className="mt-4 inline-flex rounded-full border border-line-strong p-0.5">
+            {(['w', 'b', 'random'] as const).map((c) => (
+              <button key={c} type="button" role="radio" aria-checked={settings.color === c} onClick={() => updateSettings({ color: c })} className={cn('cursor-pointer rounded-full px-3 py-1 text-[13px] transition-colors', settings.color === c ? 'bg-gold text-gold-ink' : 'text-ink-2 hover:text-ink')}>
+                {c === 'w' ? 'White' : c === 'b' ? 'Black' : 'Random'}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-[12.5px] text-ink-3">Applies when you start a new game.</p>
+        </Panel>
+
+        <Panel>
+          <PanelTitle>Helpers</PanelTitle>
+          <div className="space-y-2">
+            <Toggle label="Coaching tips" hint="Warns about hanging pieces, checks and opening basics." checked={settings.tips} onChange={(v) => { updateSettings({ tips: v }); if (!v) setHintMove(null) }} />
+            <Toggle label="Life hints" hint="Each move becomes a small life situation." checked={settings.hints} onChange={(v) => updateSettings({ hints: v })} />
+          </div>
+        </Panel>
 
         {settings.hints && game.hints.length > 1 && (
           <Panel>

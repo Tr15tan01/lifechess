@@ -27,7 +27,7 @@ export function Board2D({ pieces, orientation, selected, targets, lastMove, chec
   for (let r = 7; r >= 0; r--) for (let f = 0; f < 8; f++) squares.push(`${FILES[f]}${r + 1}`)
 
   return (
-    <div className="@container relative aspect-square w-full select-none overflow-hidden rounded-[14px] shadow-lg ring-1 ring-gold/40">
+    <div className="@container relative aspect-square w-full cursor-pointer select-none overflow-hidden rounded-[14px] shadow-lg ring-1 ring-gold/40 [-webkit-tap-highlight-color:transparent]">
       <div className="absolute inset-0 grid grid-cols-8 grid-rows-8" role="grid" aria-label="Chess board">
         {squares
           .map((sq) => ({ sq, ...pos(sq) }))
@@ -47,7 +47,7 @@ export function Board2D({ pieces, orientation, selected, targets, lastMove, chec
                 disabled={!interactive}
                 onClick={() => onSquare(sq)}
                 className={cn(
-                  'relative outline-none transition-colors focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--focus)] disabled:cursor-default',
+                  'relative cursor-pointer outline-none transition-[background-color,filter] duration-150 focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--focus)] enabled:hover:brightness-110 disabled:cursor-pointer',
                   dark ? 'bg-[#2c3448]' : 'bg-[#d9cfb8]',
                   lastMove && (lastMove.from === sq || lastMove.to === sq) && (dark ? 'bg-[#5a5233]' : 'bg-[#e6d08f]'),
                   hint && (hint.from === sq || hint.to === sq) && 'bg-ok/60',
@@ -72,19 +72,23 @@ export function Board2D({ pieces, orientation, selected, targets, lastMove, chec
         {pieces.map((p) => {
           const { x, y } = pos(p.square ?? p.last)
           const gone = !p.square
+          // Captured pieces wait for the attacker to land before fading out.
           return (
             <span
               key={p.id}
               className={cn(
-                'absolute left-0 top-0 grid size-[12.5%] place-items-center leading-none transition-[transform,opacity] duration-[420ms] ease-[cubic-bezier(.2,.8,.2,1)]',
-                gone && 'opacity-0',
+                'absolute left-0 top-0 grid size-[12.5%] place-items-center leading-none transition-[transform,opacity] duration-[750ms] ease-[cubic-bezier(.45,.05,.25,1)] will-change-transform',
+                gone && 'opacity-0 delay-[600ms]',
+                selected === p.square && p.square && 'z-10',
               )}
               style={{ transform: `translate(${x * 100}%, ${y * 100}%) scale(${gone ? 0.3 : 1})` }}
             >
               <span
                 className={cn(
-                  'text-[10.4cqw] [paint-order:stroke_fill]',
+                  'translate-y-[2%] text-[11.6cqw] [paint-order:stroke_fill]',
                   p.color === 'w' ? 'text-[#f6efe0] [-webkit-text-stroke:1.5px_#3a3020]' : 'text-[#1a1d24] [-webkit-text-stroke:1.5px_#c9a45c]',
+                  'transition-transform duration-200',
+                  selected === p.square && p.square && 'scale-110',
                   selected === p.square && 'drop-shadow-[0_0_10px_rgba(224,189,118,.9)]',
                 )}
                 style={{ textShadow: '0 3px 6px rgba(0,0,0,.35)' }}

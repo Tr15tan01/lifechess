@@ -1,8 +1,8 @@
 'use client'
 
-import { Canvas, useFrame, useThree, type ThreeEvent } from '@react-three/fiber'
-import { ContactShadows, OrbitControls } from '@react-three/drei'
-import { useEffect, useMemo, useRef } from 'react'
+import { Canvas, invalidate as invalidateAll, useFrame, useThree, type ThreeEvent } from '@react-three/fiber'
+import { ContactShadows, Environment, Lightformer, OrbitControls, RoundedBox } from '@react-three/drei'
+import { useEffect, useMemo, useRef, type MutableRefObject } from 'react'
 import * as THREE from 'three'
 import type { Color, PieceType } from '@/lib/chess/types'
 import { squareXY, type TrackedPiece } from '@/lib/chess/pieces'
@@ -17,6 +17,11 @@ import type { BoardProps } from './board-types'
 
 const GOLD = '#c9a45c'
 const FILES = 'abcdefgh'
+/** Pieces are drawn larger than the base geometry so they read well on small screens. */
+const PIECE_SCALE = 1.24
+const CAPTURED_SCALE = 0.62 * PIECE_SCALE
+/** Seconds a move takes to glide across the board. */
+const MOVE_SECONDS = 0.6
 
 function useReduced(): boolean {
   return useMemo(() => typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches, [])
@@ -83,17 +88,51 @@ const parts = () => (PARTS ??= buildParts())
 function useMaterials() {
   return useMemo(
     () => ({
-      w: new THREE.MeshPhysicalMaterial({ color: '#efe6d2', roughness: 0.38, clearcoat: 0.6, clearcoatRoughness: 0.3 }),
-      b: new THREE.MeshPhysicalMaterial({ color: '#1c1f27', roughness: 0.3, metalness: 0.35, clearcoat: 0.9, clearcoatRoughness: 0.15 }),
-      trim: new THREE.MeshStandardMaterial({ color: GOLD, metalness: 0.9, roughness: 0.25 }),
+      w: new THREE.MeshPhysicalMaterial({ color: '#f1e8d4', roughness: 0.32, clearcoat: 0.7, clearcoatRoughness: 0.22, sheen: 0.3, sheenColor: new THREE.Color('#fff4dc') }),
+      b: new THREE.MeshPhysicalMaterial({ color: '#1a1d26', roughness: 0.28, metalness: 0.3, clearcoat: 1, clearcoatRoughness: 0.12 }),
+      trim: new THREE.MeshStandardMaterial({ color: GOLD, metalness: 0.95, roughness: 0.22 }),
     }),
     [],
   )
 }
 
+/** Soft procedural grain (no image files, so the CSP holds). Greyscale, so square colours tint it. */
+function grainTexture(seed: number, streaks: boolean): THREE.CanvasTexture {
+  const size = 256
+  const c = document.createElement('canvas')
+  c.width = c.height = size
+  const ctx = c.getContext('2d')!
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, size, size)
+  let r = seed
+  const rand = () => ((r = (r * 16807) % 2147483647) / 2147483647)
+  for (let i = 0; i < 2600; i++) {
+    const g = 222 + Math.floor(rand() * 33)
+    ctx.fillStyle = `rgba(${g},${g},${g},0.5)`
+    ctx.fillRect(rand() * size, rand() * size, 2 + rand() * 3, 2 + rand() * 3)
+  }
+  if (streaks) {
+    ctx.globalAlpha = 0.07
+    for (let i = 0; i < 26; i++) {
+      ctx.strokeStyle = rand() < 0.5 ? '#000' : '#fff'
+      ctx.lineWidth = 1 + rand() * 3
+      ctx.beginPath()
+      let x = rand() * size
+      ctx.moveTo(x, 0)
+      for (let y = 0; y <= size; y += 16) ctx.lineTo((x += (rand() - 0.5) * 18), y)
+      ctx.stroke()
+    }
+  }
+  const t = new THREE.CanvasTexture(c)
+  t.colorSpace = THREE.SRGBColorSpace
+  t.anisotropy = 8
+  return t
+}
+
 // ── Pieces ───────────────────────────────────────────────────────────────────
 
 type Mats = ReturnType<typeof useMaterials>
+type HoverRef = MutableRefObject<string | null>
 
 function graveyardSlot(piece: TrackedPiece, pieces: TrackedPiece[], orientation: Color): THREE.Vector3 {
   const fallen = pieces.filter((p) => p.color === piece.color && !p.square).sort((a, b) => (a.capturedAt ?? 0) - (b.capturedAt ?? 0))
@@ -103,10 +142,10 @@ function graveyardSlot(piece: TrackedPiece, pieces: TrackedPiece[], orientation:
   const far = orientation === 'w' ? 1 : -1
   const col = Math.floor(i / 8)
   const row = i % 8
-  return new THREE.Vector3(side * (4.95 + col * 0.62), -0.04, far * (row - 3.5))
+  return new THREE.Vector3(side * (5.05 + col * 0.66), -0.04, far * (row - 3.5) * 0.98)
 }
 
-function Piece({ piece, pieces, orientation, mats, selected, interactive, onSquare, reduced }: { piece: TrackedPiece; pieces: TrackedPiece[]; orientation: Color; mats: Mats; selected: boolean; interactive: boolean; onSquare: (sq: string) => void; reduced: boolean }) {
+function Piece({ piece, pieces, orientation, mats, selected, interactive, onSquare, hoverRef, reduced }: { piece: TrackedPiece; pieces: TrackedPiece[]; orientation: Color; mats: Mats; selected: boolean; interactive: boolean; onSquare: (sq: string) => void; hoverRef: HoverRef; reduced: boolean }) {
   const ref = useRef<THREE.Group>(null)
   const gone = !piece.square
   const target = gone ? graveyardSlot(piece, pieces, orientation) : world(piece.square!)
@@ -114,7 +153,10 @@ function Piece({ piece, pieces, orientation, mats, selected, interactive, onSqua
   // Position is owned by the animation after mount; a stable prop object stops re-renders snapping it.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const initial = useMemo(() => target.clone(), [])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const initialScale = useMemo(() => (gone ? CAPTURED_SCALE : PIECE_SCALE), [])
   const { invalidate } = useThree()
+  useEffect(() => invalidate(), [selected, invalidate])
 
   useEffect(() => {
     const a = anim.current
@@ -125,9 +167,9 @@ function Piece({ piece, pieces, orientation, mats, selected, interactive, onSqua
     a.to = target.clone()
     a.t = reduced ? 1 : 0
     // Captured pieces leave once the capturing piece lands.
-    a.delay = gone ? 0.32 : 0
+    a.delay = gone ? MOVE_SECONDS * 0.8 : 0
     const dist = a.from.distanceTo(a.to)
-    a.lift = gone ? 0.9 : piece.type === 'n' ? 0.75 : 0.18 + dist * 0.05
+    a.lift = gone ? 1.1 : piece.type === 'n' ? 0.9 : 0.22 + dist * 0.06
     invalidate()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [target.x, target.z, gone])
@@ -136,12 +178,15 @@ function Piece({ piece, pieces, orientation, mats, selected, interactive, onSqua
     const g = ref.current
     if (!g) return
     const a = anim.current
+    const s = gone ? CAPTURED_SCALE : PIECE_SCALE
+    // The canvas renders on demand; keep frames coming only while this piece is moving.
+    if (a.delay > 0 || a.t < 1 || (selected && !reduced) || Math.abs(g.scale.x - s) > 0.001) state.invalidate()
     if (a.delay > 0) {
       a.delay -= dt
       return
     }
     if (a.t < 1) {
-      a.t = Math.min(1, a.t + dt / 0.48)
+      a.t = Math.min(1, a.t + Math.min(dt, 1 / 30) / MOVE_SECONDS)
       const e = a.t < 0.5 ? 4 * a.t ** 3 : 1 - (-2 * a.t + 2) ** 3 / 2
       g.position.lerpVectors(a.from, a.to, e)
       g.position.y = a.to.y + Math.sin(Math.PI * e) * a.lift
@@ -149,8 +194,7 @@ function Piece({ piece, pieces, orientation, mats, selected, interactive, onSqua
       g.position.copy(a.to)
       if (selected && !reduced) g.position.y = 0.12 + Math.sin(state.clock.elapsedTime * 4) * 0.04
     }
-    const s = gone ? 0.62 : 1
-    g.scale.setScalar(THREE.MathUtils.damp(g.scale.x, s, 6, dt))
+    if (Math.abs(g.scale.x - s) > 0.001) g.scale.setScalar(THREE.MathUtils.damp(g.scale.x, s, 5, dt))
   })
 
   // Knights face their owner's left, the classic profile view.
@@ -160,7 +204,20 @@ function Piece({ piece, pieces, orientation, mats, selected, interactive, onSqua
     if (interactive && piece.square) onSquare(piece.square)
   }
   return (
-    <group ref={ref} position={initial} rotation={[0, facing, 0]} onClick={click}>
+    <group
+      ref={ref}
+      position={initial}
+      scale={initialScale}
+      rotation={[0, facing, 0]}
+      onClick={click}
+      onPointerMove={(e) => {
+        e.stopPropagation()
+        if (hoverRef.current !== (piece.square ?? null)) {
+          hoverRef.current = piece.square ?? null
+          invalidate()
+        }
+      }}
+    >
       {parts()[piece.type].map((p, i) => (
         <mesh key={i} geometry={p.geo} position={p.pos} rotation={p.rot} scale={p.scale} material={p.trim ? mats.trim : mats[piece.color]} castShadow receiveShadow />
       ))}
@@ -170,12 +227,16 @@ function Piece({ piece, pieces, orientation, mats, selected, interactive, onSqua
 
 // ── Board ────────────────────────────────────────────────────────────────────
 
-function Squares({ selected, targets, lastMove, checkSquare, hint, occupied, interactive, onSquare }: Pick<BoardProps, 'selected' | 'targets' | 'lastMove' | 'checkSquare' | 'hint' | 'interactive' | 'onSquare'> & { occupied: Set<string> }) {
+const overlayMat = { transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2, toneMapped: false } as const
+
+function Squares({ selected, targets, lastMove, checkSquare, hint, occupied, interactive, onSquare, hoverRef }: Pick<BoardProps, 'selected' | 'targets' | 'lastMove' | 'checkSquare' | 'hint' | 'interactive' | 'onSquare'> & { occupied: Set<string>; hoverRef: HoverRef }) {
+  const invalidate = useThree((s) => s.invalidate)
   const squares = useMemo(() => {
     const out: string[] = []
     for (let r = 0; r < 8; r++) for (let f = 0; f < 8; f++) out.push(`${FILES[f]}${r + 1}`)
     return out
   }, [])
+  const tex = useMemo(() => ({ light: grainTexture(7, true), dark: grainTexture(31, true) }), [])
   return (
     <group>
       {squares.map((sq) => {
@@ -184,7 +245,7 @@ function Squares({ selected, targets, lastMove, checkSquare, hint, occupied, int
         const p = world(sq)
         const isLast = lastMove && (lastMove.from === sq || lastMove.to === sq)
         const isHint = hint && (hint.from === sq || hint.to === sq)
-        const color = selected === sq ? '#b8913f' : isHint ? '#3f8a63' : isLast ? (dark ? '#4d4630' : '#d8c27f') : dark ? '#262d3e' : '#d6cbb2'
+        const color = selected === sq ? '#c99a45' : isHint ? '#4a9a70' : isLast ? (dark ? '#5a5034' : '#e2cc86') : dark ? '#2a3246' : '#ddd2b9'
         return (
           <group key={sq} position={[p.x, 0, p.z]}>
             <mesh
@@ -194,28 +255,33 @@ function Squares({ selected, targets, lastMove, checkSquare, hint, occupied, int
                 e.stopPropagation()
                 if (interactive) onSquare(sq)
               }}
-              onPointerOver={() => interactive && (document.body.style.cursor = 'pointer')}
-              onPointerOut={() => (document.body.style.cursor = '')}
+              onPointerMove={(e) => {
+                e.stopPropagation()
+                if (hoverRef.current !== sq) {
+                  hoverRef.current = sq
+                  invalidate()
+                }
+              }}
             >
               <boxGeometry args={[1, 0.1, 1]} />
-              <meshStandardMaterial color={color} roughness={dark ? 0.55 : 0.7} metalness={dark ? 0.15 : 0.02} />
+              <meshStandardMaterial color={color} map={dark ? tex.dark : tex.light} roughness={dark ? 0.4 : 0.52} metalness={dark ? 0.12 : 0} envMapIntensity={0.6} />
             </mesh>
             {targets.includes(sq) &&
               (occupied.has(sq) ? (
-                <mesh position={[0, 0.006, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-                  <ringGeometry args={[0.38, 0.47, 40]} />
-                  <meshBasicMaterial color={GOLD} transparent opacity={0.9} />
+                <mesh position={[0, 0.012, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={2}>
+                  <ringGeometry args={[0.4, 0.48, 48]} />
+                  <meshBasicMaterial color={GOLD} opacity={0.9} {...overlayMat} />
                 </mesh>
               ) : (
-                <mesh position={[0, 0.006, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-                  <circleGeometry args={[0.13, 32]} />
-                  <meshBasicMaterial color={GOLD} transparent opacity={0.85} />
+                <mesh position={[0, 0.012, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={2}>
+                  <circleGeometry args={[0.14, 32]} />
+                  <meshBasicMaterial color={GOLD} opacity={0.85} {...overlayMat} />
                 </mesh>
               ))}
             {checkSquare === sq && (
-              <mesh position={[0, 0.004, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+              <mesh position={[0, 0.008, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={1}>
                 <circleGeometry args={[0.48, 40]} />
-                <meshBasicMaterial color="#d25046" transparent opacity={0.55} />
+                <meshBasicMaterial color="#d25046" opacity={0.55} {...overlayMat} />
               </mesh>
             )}
           </group>
@@ -225,27 +291,107 @@ function Squares({ selected, targets, lastMove, checkSquare, hint, occupied, int
   )
 }
 
-function Frame() {
+/**
+ * Hover outline. It follows the pointer through a ref and eases in and out in
+ * useFrame, so hovering never re-renders the board (the old cause of flicker).
+ */
+function HoverMarker({ hoverRef, interactive }: { hoverRef: HoverRef; interactive: boolean }) {
+  const ref = useRef<THREE.Mesh>(null)
+  const mat = useRef<THREE.MeshBasicMaterial>(null)
+  useFrame((state, dt) => {
+    const m = ref.current
+    if (!m || !mat.current) return
+    const sq = interactive ? hoverRef.current : null
+    if (sq) {
+      const p = world(sq)
+      if (mat.current.opacity < 0.05) m.position.set(p.x, 0.014, p.z)
+      else {
+        m.position.x = THREE.MathUtils.damp(m.position.x, p.x, 22, dt)
+        m.position.z = THREE.MathUtils.damp(m.position.z, p.z, 22, dt)
+      }
+    }
+    const goal = sq ? 0.95 : 0
+    mat.current.opacity = THREE.MathUtils.damp(mat.current.opacity, goal, 14, dt)
+    m.visible = mat.current.opacity > 0.01
+    const p = sq ? world(sq) : null
+    if (Math.abs(mat.current.opacity - goal) > 0.005 || (p && (Math.abs(m.position.x - p.x) > 0.002 || Math.abs(m.position.z - p.z) > 0.002))) state.invalidate()
+  })
   return (
-    <group>
-      <mesh position={[0, -0.26, 0]} receiveShadow castShadow>
-        <boxGeometry args={[9.0, 0.32, 9.0]} />
-        <meshStandardMaterial color="#171a22" roughness={0.45} metalness={0.3} />
-      </mesh>
+    <mesh ref={ref} rotation={[-Math.PI / 2, 0, Math.PI / 4]} renderOrder={3} visible={false}>
+      <ringGeometry args={[0.58, 0.67, 4, 1]} />
+      <meshBasicMaterial ref={mat} color="#f0d48f" opacity={0} {...overlayMat} />
+    </mesh>
+  )
+}
+
+/** File and rank letters printed on the frame, upright from the player's side. */
+function Coordinates({ orientation }: { orientation: Color }) {
+  const texture = useMemo(() => {
+    const px = 1024
+    const k = px / 9
+    const c = document.createElement('canvas')
+    c.width = c.height = px
+    const ctx = c.getContext('2d')!
+    ctx.font = `600 ${Math.round(k * 0.24)}px "IBM Plex Sans", system-ui, sans-serif`
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillStyle = '#d9bd80'
+    const flip = orientation === 'b'
+    const label = (text: string, x: number, z: number) => {
+      ctx.save()
+      ctx.translate((x + 4.5) * k, (z + 4.5) * k)
+      if (flip) ctx.rotate(Math.PI)
+      ctx.fillText(text, 0, 0)
+      ctx.restore()
+    }
+    const edge = 4.27
+    for (let i = 0; i < 8; i++) {
+      label(FILES[i]!, i - 3.5, flip ? -edge : edge)
+      label(String(i + 1), flip ? edge : -edge, 3.5 - i)
+    }
+    const t = new THREE.CanvasTexture(c)
+    t.colorSpace = THREE.SRGBColorSpace
+    t.anisotropy = 8
+    return t
+  }, [orientation])
+  return (
+    <mesh position={[0, -0.098, 0]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={1}>
+      <planeGeometry args={[9, 9]} />
+      <meshBasicMaterial map={texture} {...overlayMat} opacity={0.85} />
+    </mesh>
+  )
+}
+
+function Frame({ hoverRef }: { hoverRef: HoverRef }) {
+  const invalidate = useThree((s) => s.invalidate)
+  const clear = () => {
+    if (hoverRef.current === null) return
+    hoverRef.current = null
+    invalidate()
+  }
+  return (
+    <group onPointerMove={clear}>
+      <RoundedBox args={[9.0, 0.3, 9.0]} radius={0.1} smoothness={4} position={[0, -0.25, 0]} receiveShadow castShadow>
+        <meshStandardMaterial color="#161a23" roughness={0.3} metalness={0.35} />
+      </RoundedBox>
+      <RoundedBox args={[9.5, 0.18, 9.5]} radius={0.08} smoothness={4} position={[0, -0.46, 0]} receiveShadow>
+        <meshStandardMaterial color="#0f1218" roughness={0.5} metalness={0.2} />
+      </RoundedBox>
+      {/* Inlaid gold border hugging the squares */}
       {[
-        [0, 4.18, 8.42, 0.06],
-        [0, -4.18, 8.42, 0.06],
-        [4.18, 0, 0.06, 8.42],
-        [-4.18, 0, 0.06, 8.42],
+        [0, 4.04, 8.14, 0.05],
+        [0, -4.04, 8.14, 0.05],
+        [4.04, 0, 0.05, 8.14],
+        [-4.04, 0, 0.05, 8.14],
       ].map(([x, z, w, d], i) => (
-        <mesh key={i} position={[x!, -0.095, z!]}>
-          <boxGeometry args={[w!, 0.02, d!]} />
-          <meshStandardMaterial color={GOLD} metalness={0.9} roughness={0.25} />
+        <mesh key={i} position={[x!, -0.098, z!]}>
+          <boxGeometry args={[w!, 0.012, d!]} />
+          <meshStandardMaterial color={GOLD} metalness={0.95} roughness={0.2} />
         </mesh>
       ))}
-      <mesh position={[0, -0.6, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
-        <circleGeometry args={[11, 64]} />
-        <meshStandardMaterial color="#10131a" roughness={0.9} />
+      <mesh position={[0, -0.66, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
+        <circleGeometry args={[14, 64]} />
+        <meshStandardMaterial color="#0e1117" roughness={0.95} />
       </mesh>
     </group>
   )
@@ -254,46 +400,63 @@ function Frame() {
 /** Seat the camera behind the player's pieces; narrow viewports get a wider lens so the whole board fits. */
 function CameraRig({ orientation }: { orientation: Color }) {
   const { get, size } = useThree()
-  const aspect = size.width / Math.max(1, size.height)
+  // Bucket the aspect ratio so tiny resizes (mobile toolbars, scrollbars) never re-seat the camera mid-game.
+  const narrow = size.width / Math.max(1, size.height) < 1.1
   useEffect(() => {
     const camera = get().camera
     const side = orientation === 'w' ? 1 : -1
-    camera.position.set(0, 9.6, side * 9.2)
+    camera.position.set(0, narrow ? 10.2 : 9.4, side * (narrow ? 8.9 : 8.8))
     if (camera instanceof THREE.PerspectiveCamera) {
-      camera.fov = aspect < 1.1 ? 44 : 36
+      camera.fov = narrow ? 41 : 36
+      camera.near = 1
+      camera.far = 60
       camera.updateProjectionMatrix()
     }
-  }, [orientation, get, aspect])
+  }, [orientation, get, narrow])
   return null
 }
 
 export default function Board3D(props: BoardProps & { className?: string }) {
   const reduced = useReduced()
   const mats = useMaterials()
+  const hoverRef = useRef<string | null>(null)
   const occupied = useMemo(() => new Set(props.pieces.filter((p) => p.square).map((p) => p.square!)), [props.pieces])
   return (
     <Canvas
       className={props.className}
-      shadows
-      dpr={[1, 1.75]}
-      camera={{ position: [0, 9.6, 9.2], fov: 36 }}
+      style={{ cursor: 'pointer' }}
+      shadows="percentage"
+      dpr={[1, 2]}
+      camera={{ position: [0, 9.4, 8.8], fov: 36, near: 1, far: 60 }}
       gl={{ antialias: true, alpha: true, powerPreference: 'high-performance' }}
-      onPointerMissed={() => (document.body.style.cursor = '')}
+      frameloop="demand"
+      onPointerLeave={() => {
+        hoverRef.current = null
+        invalidateAll()
+      }}
       aria-label="3D chess board"
     >
       <CameraRig orientation={props.orientation} />
-      <ambientLight intensity={0.42} />
-      <directionalLight position={[5, 11, 5]} intensity={2.1} castShadow shadow-mapSize={[2048, 2048]} shadow-camera-left={-7} shadow-camera-right={7} shadow-camera-top={7} shadow-camera-bottom={-7} />
-      <spotLight position={[0, 9, 0]} angle={0.7} penumbra={0.9} intensity={28} color="#ffd9a0" />
-      <directionalLight position={[-6, 3, -5]} intensity={0.8} color="#6f8fd8" />
-      <pointLight position={[6, 2, 6]} intensity={5} color={GOLD} distance={14} />
-      <Frame />
-      <Squares {...props} occupied={occupied} />
+      {/* Studio reflections built from in-scene light panels: rendered once, no HDR download. */}
+      <Environment resolution={256} frames={1}>
+        <Lightformer form="rect" intensity={2.2} color="#fff1d6" position={[0, 6, 0]} rotation={[Math.PI / 2, 0, 0]} scale={[10, 6, 1]} />
+        <Lightformer form="rect" intensity={1.2} color="#ffe2b0" position={[6, 3, 4]} rotation={[0, -Math.PI / 3, 0]} scale={[6, 2, 1]} />
+        <Lightformer form="rect" intensity={0.9} color="#8fa8e8" position={[-6, 2, -4]} rotation={[0, Math.PI / 3, 0]} scale={[6, 2, 1]} />
+        <Lightformer form="ring" intensity={1.5} color={GOLD} position={[0, 2, 8]} scale={3} />
+      </Environment>
+      <ambientLight intensity={0.25} />
+      <directionalLight position={[5, 11, 5]} intensity={1.8} castShadow shadow-mapSize={[2048, 2048]} shadow-bias={-0.0004} shadow-normalBias={0.03} shadow-camera-left={-6.5} shadow-camera-right={6.5} shadow-camera-top={6.5} shadow-camera-bottom={-6.5} shadow-camera-near={1} shadow-camera-far={30} />
+      <spotLight position={[0, 9, 0]} angle={0.7} penumbra={0.9} intensity={18} color="#ffd9a0" />
+      <directionalLight position={[-6, 3, -5]} intensity={0.5} color="#6f8fd8" />
+      <Frame hoverRef={hoverRef} />
+      <Coordinates orientation={props.orientation} />
+      <Squares {...props} occupied={occupied} hoverRef={hoverRef} />
+      <HoverMarker hoverRef={hoverRef} interactive={props.interactive} />
       {props.pieces.map((p) => (
-        <Piece key={p.id} piece={p} pieces={props.pieces} orientation={props.orientation} mats={mats} selected={props.selected === p.square && !!p.square} interactive={props.interactive} onSquare={props.onSquare} reduced={reduced} />
+        <Piece key={p.id} piece={p} pieces={props.pieces} orientation={props.orientation} mats={mats} selected={props.selected === p.square && !!p.square} interactive={props.interactive} onSquare={props.onSquare} hoverRef={hoverRef} reduced={reduced} />
       ))}
-      <ContactShadows position={[0, -0.59, 0]} opacity={0.45} scale={22} blur={2.4} far={2} />
-      <OrbitControls enablePan={false} enableDamping minDistance={8} maxDistance={18} minPolarAngle={0.25} maxPolarAngle={1.15} target={[0, 0, props.orientation === 'w' ? 0.45 : -0.45]} />
+      <ContactShadows position={[0, -0.6, 0]} opacity={0.5} scale={24} blur={2.4} far={2} resolution={512} />
+      <OrbitControls enablePan={false} enableDamping dampingFactor={0.08} minDistance={8} maxDistance={18} minPolarAngle={0.25} maxPolarAngle={1.15} target={[0, 0, props.orientation === 'w' ? 0.6 : -0.6]} />
     </Canvas>
   )
 }

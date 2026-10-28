@@ -8,7 +8,7 @@ export function SignOutButton() {
   return (
     <button
       type="button"
-      className="rounded-full px-3 py-1.5 text-ink-2 hover:bg-surface-2 hover:text-ink"
+      className="shrink-0 whitespace-nowrap rounded-full px-2.5 py-1.5 text-ink-2 sm:px-3 hover:bg-surface-2 hover:text-ink"
       onClick={async () => {
         await api('/api/auth/logout', { method: 'POST', body: {} }).catch(() => {})
         router.refresh()
